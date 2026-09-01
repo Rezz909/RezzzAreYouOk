@@ -11,20 +11,24 @@ const LEASE_MS = 90_000;
 const MAX_ATTEMPTS = 5;
 const DONE_RETENTION_MS = 60 * 60 * 1000;
 
+if (!process.env.DATABASE_URL) {
+  console.error("DATABASE_URL belum ada");
+  process.exit(1);
+}
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: process.env.NODE_ENV === "production"
-    ? { rejectUnauthorized: false }
-    : false,
 });
 
-app.use(express.json({
-  verify: (req, res, buf) => {
-    req.rawBody = buf.toString("utf8");
-  }
-}));
+app.use(
+  express.json({
+    verify: (req, res, buf) => {
+      req.rawBody = buf.toString("utf8");
+    },
+  })
+);
 
-function json(res, data, status = 200) {
+function sendJson(res, data, status = 200) {
   return res.status(status).json(data);
 }
 
@@ -32,27 +36,30 @@ async function verifySaweriaSignature(rawBody, signatureHeader, streamKey) {
   if (!streamKey) return true;
   if (!signatureHeader) return false;
 
-  const hmac = crypto.createHmac("sha256", streamKey);
-  hmac.update(rawBody);
-  const hex = hmac.digest("hex");
+  const expected = crypto
+    .createHmac("sha256", streamKey)
+    .update(rawBody)
+    .digest("hex");
 
-  if (hex.length !== signatureHeader.length) return false;
+  if (expected.length !== signatureHeader.length) return false;
 
-  let diff = 0;
-  for (let i = 0; i < hex.length; i++) {
-    diff |= hex.charCodeAt(i) ^ signatureHeader.charCodeAt(i);
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(expected),
+      Buffer.from(signatureHeader)
+    );
+  } catch {
+    return false;
   }
-
-  return diff === 0;
 }
 
-async function initDb() {
+async function initDatabase() {
   await pool.query(`
     CREATE TABLE IF NOT EXISTS donations (
       id TEXT PRIMARY KEY,
-      amount_raw BIGINT,
-      donator_name TEXT,
-      message TEXT,
+      amount_raw BIGINT DEFAULT 0,
+      donator_name TEXT DEFAULT '',
+      message TEXT DEFAULT '',
       created_at TEXT,
       status TEXT NOT NULL DEFAULT 'pending',
       lease_token TEXT,
@@ -63,42 +70,45 @@ async function initDb() {
     )
   `);
 
-  console.log("Database ready");
+  console.log("Database connected");
 }
 
 async function pushItem(payload) {
-  const exists = await pool.query(
-    "SELECT id FROM donations WHERE id = $1 LIMIT 1",
-    [payload.id]
-  );
+  const id = payload.id || crypto.randomUUID();
 
-  if (exists.rows.length > 0) {
-    return { ok: true, deduped: true };
-  }
-
-  await pool.query(`
+  const result = await pool.query(
+    `
     INSERT INTO donations (
       id,
       amount_raw,
       donator_name,
       message,
-      created_at,
-      status,
-      lease_token,
-      lease_expires,
-      attempts,
-      last_error
+      created_at
     )
-    VALUES ($1, $2, $3, $4, $5, 'pending', NULL, 0, 0, '')
-  `, [
-    payload.id,
-    payload.amount_raw ?? 0,
-    payload.donator_name ?? "",
-    payload.message ?? "",
-    payload.created_at ?? new Date().toISOString()
-  ]);
+    VALUES ($1, $2, $3, $4, $5)
+    ON CONFLICT (id) DO NOTHING
+    RETURNING id
+    `,
+    [
+      id,
+      Number(payload.amount_raw || 0),
+      payload.donator_name || "",
+      payload.message || "",
+      payload.created_at || new Date().toISOString(),
+    ]
+  );
 
-  return { ok: true };
+  if (result.rowCount === 0) {
+    return {
+      ok: true,
+      deduped: true,
+    };
+  }
+
+  return {
+    ok: true,
+    id,
+  };
 }
 
 async function pullItems(limit) {
@@ -109,7 +119,8 @@ async function pullItems(limit) {
 
     const now = Date.now();
 
-    await client.query(`
+    await client.query(
+      `
       UPDATE donations
       SET
         status = 'pending',
@@ -117,24 +128,30 @@ async function pullItems(limit) {
         lease_expires = 0
       WHERE status = 'leased'
       AND lease_expires < $1
-    `, [now]);
+      `,
+      [now]
+    );
 
-    const rows = await client.query(`
+    const result = await client.query(
+      `
       SELECT *
       FROM donations
       WHERE status = 'pending'
       ORDER BY created_at ASC
       LIMIT $1
       FOR UPDATE SKIP LOCKED
-    `, [limit]);
+      `,
+      [limit]
+    );
 
     const output = [];
 
-    for (const item of rows.rows) {
+    for (const item of result.rows) {
       const leaseToken = crypto.randomUUID();
       const leaseExpires = now + LEASE_MS;
 
-      await client.query(`
+      await client.query(
+        `
         UPDATE donations
         SET
           status = 'leased',
@@ -142,30 +159,28 @@ async function pullItems(limit) {
           lease_expires = $2,
           attempts = attempts + 1
         WHERE id = $3
-      `, [
-        leaseToken,
-        leaseExpires,
-        item.id
-      ]);
+        `,
+        [leaseToken, leaseExpires, item.id]
+      );
 
       output.push({
         id: item.id,
         leaseToken,
-        amount: item.amount_raw,
-        amount_raw: item.amount_raw,
+        amount: Number(item.amount_raw),
+        amount_raw: Number(item.amount_raw),
         donator_name: item.donator_name,
         message: item.message,
         createdAt: item.created_at,
-        created_at: item.created_at
+        created_at: item.created_at,
       });
     }
 
     await client.query("COMMIT");
 
     return output;
-  } catch (err) {
+  } catch (error) {
     await client.query("ROLLBACK");
-    throw err;
+    throw error;
   } finally {
     client.release();
   }
@@ -178,12 +193,19 @@ async function ackItems(acks) {
     await client.query("BEGIN");
 
     for (const ack of acks) {
+      if (!ack?.id) continue;
+
       const result = await client.query(
-        "SELECT * FROM donations WHERE id = $1 LIMIT 1",
+        `
+        SELECT *
+        FROM donations
+        WHERE id = $1
+        LIMIT 1
+        `,
         [ack.id]
       );
 
-      if (result.rows.length === 0) continue;
+      if (result.rowCount === 0) continue;
 
       const item = result.rows[0];
 
@@ -196,23 +218,24 @@ async function ackItems(acks) {
       }
 
       if (ack.status === "done") {
-        await client.query(`
+        await client.query(
+          `
           UPDATE donations
           SET
             status = 'done',
-            done_at = $1
+            done_at = $1,
+            lease_token = NULL,
+            lease_expires = 0
           WHERE id = $2
-        `, [
-          Date.now(),
-          ack.id
-        ]);
+          `,
+          [Date.now(), ack.id]
+        );
       } else {
-        const nextStatus =
-          item.attempts >= MAX_ATTEMPTS
-            ? "dead"
-            : "pending";
+        const status =
+          Number(item.attempts) >= MAX_ATTEMPTS ? "dead" : "pending";
 
-        await client.query(`
+        await client.query(
+          `
           UPDATE donations
           SET
             status = $1,
@@ -220,36 +243,40 @@ async function ackItems(acks) {
             lease_expires = 0,
             last_error = $2
           WHERE id = $3
-        `, [
-          nextStatus,
-          String(ack.error || "").slice(0, 250),
-          ack.id
-        ]);
+          `,
+          [
+            status,
+            String(ack.error || "").slice(0, 250),
+            ack.id,
+          ]
+        );
       }
     }
 
     const cutoff = Date.now() - DONE_RETENTION_MS;
 
-    await client.query(`
+    await client.query(
+      `
       DELETE FROM donations
       WHERE status = 'done'
       AND done_at < $1
-    `, [cutoff]);
+      `,
+      [cutoff]
+    );
 
     await client.query("COMMIT");
-  } catch (err) {
+  } catch (error) {
     await client.query("ROLLBACK");
-    throw err;
+    throw error;
   } finally {
     client.release();
   }
 }
 
 app.get("/", (req, res) => {
-  return json(res, {
+  return sendJson(res, {
     ok: true,
     service: "Rezzz Backend",
-    message: "Backend online"
   });
 });
 
@@ -257,17 +284,21 @@ app.get("/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
 
-    return json(res, {
+    return sendJson(res, {
       ok: true,
       service: "rezzz-backend",
-      database: "connected"
+      database: "connected",
     });
-  } catch (err) {
-    return json(res, {
-      ok: false,
-      database: "disconnected",
-      error: err.message
-    }, 500);
+  } catch (error) {
+    return sendJson(
+      res,
+      {
+        ok: false,
+        database: "disconnected",
+        error: error.message,
+      },
+      500
+    );
   }
 });
 
@@ -285,37 +316,45 @@ app.post("/webhook", async (req, res) => {
     );
 
     if (!valid) {
-      return json(res, {
-        ok: false,
-        error: "invalid_signature"
-      }, 401);
+      return sendJson(
+        res,
+        {
+          ok: false,
+          error: "invalid_signature",
+        },
+        401
+      );
     }
 
     const payload = req.body || {};
 
     if (payload.type && payload.type !== "donation") {
-      return json(res, {
+      return sendJson(res, {
         ok: true,
-        skipped: true
+        skipped: true,
       });
     }
 
     const result = await pushItem({
-      id: payload.id || crypto.randomUUID(),
+      id: payload.id,
       amount_raw: payload.amount_raw,
       donator_name: payload.donator_name,
       message: payload.message,
-      created_at: payload.created_at
+      created_at: payload.created_at,
     });
 
-    return json(res, result);
-  } catch (err) {
-    console.error(err);
+    return sendJson(res, result);
+  } catch (error) {
+    console.error(error);
 
-    return json(res, {
-      ok: false,
-      error: err.message
-    }, 500);
+    return sendJson(
+      res,
+      {
+        ok: false,
+        error: error.message,
+      },
+      500
+    );
   }
 });
 
@@ -323,46 +362,51 @@ app.post("/api/pull", async (req, res) => {
   try {
     const limit = Math.max(
       1,
-      Math.min(
-        25,
-        Number(req.body?.limit) || 10
-      )
+      Math.min(25, Number(req.body?.limit) || 10)
     );
 
     const items = await pullItems(limit);
 
-    return json(res, {
+    return sendJson(res, {
       ok: true,
-      items
+      items,
     });
-  } catch (err) {
-    console.error(err);
+  } catch (error) {
+    console.error(error);
 
-    return json(res, {
-      ok: false,
-      error: err.message
-    }, 500);
+    return sendJson(
+      res,
+      {
+        ok: false,
+        error: error.message,
+      },
+      500
+    );
   }
 });
 
 app.post("/api/ack", async (req, res) => {
   try {
-    const acks = Array.isArray(req.body?.items)
+    const items = Array.isArray(req.body?.items)
       ? req.body.items
       : [];
 
-    await ackItems(acks);
+    await ackItems(items);
 
-    return json(res, {
-      ok: true
+    return sendJson(res, {
+      ok: true,
     });
-  } catch (err) {
-    console.error(err);
+  } catch (error) {
+    console.error(error);
 
-    return json(res, {
-      ok: false,
-      error: err.message
-    }, 500);
+    return sendJson(
+      res,
+      {
+        ok: false,
+        error: error.message,
+      },
+      500
+    );
   }
 });
 
@@ -372,28 +416,34 @@ app.post("/debug/push", async (req, res) => {
       !process.env.DEBUG_TOKEN ||
       req.headers["x-debug-token"] !== process.env.DEBUG_TOKEN
     ) {
-      return json(res, {
-        ok: false,
-        error: "unauthorized"
-      }, 401);
+      return sendJson(
+        res,
+        {
+          ok: false,
+          error: "unauthorized",
+        },
+        401
+      );
     }
 
-    const payload = req.body || {};
-
     const result = await pushItem({
-      id: payload.id || crypto.randomUUID(),
-      amount_raw: payload.amount_raw || 5000,
-      donator_name: payload.donator_name || "Tester",
-      message: payload.message || "test donasi",
-      created_at: new Date().toISOString()
+      id: req.body?.id,
+      amount_raw: req.body?.amount_raw || 5000,
+      donator_name: req.body?.donator_name || "Tester",
+      message: req.body?.message || "test donasi",
+      created_at: new Date().toISOString(),
     });
 
-    return json(res, result);
-  } catch (err) {
-    return json(res, {
-      ok: false,
-      error: err.message
-    }, 500);
+    return sendJson(res, result);
+  } catch (error) {
+    return sendJson(
+      res,
+      {
+        ok: false,
+        error: error.message,
+      },
+      500
+    );
   }
 });
 
@@ -403,10 +453,14 @@ app.get("/debug/queue", async (req, res) => {
       !process.env.DEBUG_TOKEN ||
       req.headers["x-debug-token"] !== process.env.DEBUG_TOKEN
     ) {
-      return json(res, {
-        ok: false,
-        error: "unauthorized"
-      }, 401);
+      return sendJson(
+        res,
+        {
+          ok: false,
+          error: "unauthorized",
+        },
+        401
+      );
     }
 
     const result = await pool.query(`
@@ -415,16 +469,20 @@ app.get("/debug/queue", async (req, res) => {
       ORDER BY created_at ASC
     `);
 
-    return json(res, {
+    return sendJson(res, {
       ok: true,
-      count: result.rows.length,
-      items: result.rows
+      count: result.rowCount,
+      items: result.rows,
     });
-  } catch (err) {
-    return json(res, {
-      ok: false,
-      error: err.message
-    }, 500);
+  } catch (error) {
+    return sendJson(
+      res,
+      {
+        ok: false,
+        error: error.message,
+      },
+      500
+    );
   }
 });
 
@@ -434,15 +492,18 @@ app.post("/admin/retry", async (req, res) => {
       !process.env.DEBUG_TOKEN ||
       req.headers["x-debug-token"] !== process.env.DEBUG_TOKEN
     ) {
-      return json(res, {
-        ok: false,
-        error: "unauthorized"
-      }, 401);
+      return sendJson(
+        res,
+        {
+          ok: false,
+          error: "unauthorized",
+        },
+        401
+      );
     }
 
-    const id = req.body?.id;
-
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       UPDATE donations
       SET
         status = 'pending',
@@ -452,23 +513,33 @@ app.post("/admin/retry", async (req, res) => {
         last_error = ''
       WHERE id = $1
       RETURNING id
-    `, [id]);
+      `,
+      [req.body?.id]
+    );
 
-    if (result.rows.length === 0) {
-      return json(res, {
-        ok: false,
-        error: "not_found"
-      }, 404);
+    if (result.rowCount === 0) {
+      return sendJson(
+        res,
+        {
+          ok: false,
+          error: "not_found",
+        },
+        404
+      );
     }
 
-    return json(res, {
-      ok: true
+    return sendJson(res, {
+      ok: true,
     });
-  } catch (err) {
-    return json(res, {
-      ok: false,
-      error: err.message
-    }, 500);
+  } catch (error) {
+    return sendJson(
+      res,
+      {
+        ok: false,
+        error: error.message,
+      },
+      500
+    );
   }
 });
 
@@ -478,38 +549,51 @@ app.post("/admin/delete", async (req, res) => {
       !process.env.DEBUG_TOKEN ||
       req.headers["x-debug-token"] !== process.env.DEBUG_TOKEN
     ) {
-      return json(res, {
-        ok: false,
-        error: "unauthorized"
-      }, 401);
+      return sendJson(
+        res,
+        {
+          ok: false,
+          error: "unauthorized",
+        },
+        401
+      );
     }
 
-    const id = req.body?.id;
-
     const result = await pool.query(
-      "DELETE FROM donations WHERE id = $1",
-      [id]
+      `
+      DELETE FROM donations
+      WHERE id = $1
+      `,
+      [req.body?.id]
     );
 
-    return json(res, {
+    return sendJson(res, {
       ok: true,
-      removed: result.rowCount > 0
+      removed: result.rowCount > 0,
     });
-  } catch (err) {
-    return json(res, {
-      ok: false,
-      error: err.message
-    }, 500);
+  } catch (error) {
+    return sendJson(
+      res,
+      {
+        ok: false,
+        error: error.message,
+      },
+      500
+    );
   }
 });
 
-initDb()
-  .then(() => {
+async function start() {
+  try {
+    await initDatabase();
+
     app.listen(PORT, "0.0.0.0", () => {
-      console.log(`Rezzz Backend running on port ${PORT}`);
+      console.log(`Server running on port ${PORT}`);
     });
-  })
-  .catch((err) => {
-    console.error("Database init failed:", err);
+  } catch (error) {
+    console.error("START ERROR:", error);
     process.exit(1);
-  });
+  }
+}
+
+start();
